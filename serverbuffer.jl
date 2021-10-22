@@ -1,24 +1,31 @@
-using Random, StatsBase, Parameters, LinearAlgebra
+using Random, StatsBase, Parameters, LinearAlgebra, Distributions
 import Base: isempty
 include("simulate.jl")
+
+Random.seed!(0)
 
 struct Job
     unique_id::Int64
 end
 
+function Job(unique_id::Int64)
+    return Job(unique_id)
+end
+
 struct Server
+    unique_id::Int
     buffer::Queue{Job}           # First element in buffer is currently served job
     max_buffer_size::Int         # Buffer size before overflow
-    overflow_vector::Vector{Int} # Probabilities of where an overflown job will go
-    move_vector::Vector{Int}     # Probabilities of where a finished job will go
+    overflow_vector::Vector{Float64} # Probabilities of where an overflown job will go
+    move_vector::Vector{Float64}     # Probabilities of where a finished job will go
     service_rate::Float64        # Mean service rate of this server
 end
 
-function Server(max_buffer_size::Int,       
-    overflow_vector::Vector{Int}, 
-    move_vector::Vector{Int},  
+function Server(unique_id::Int, max_buffer_size::Int,       
+    overflow_vector::Vector{Float64}, 
+    move_vector::Vector{Float64},  
     service_rate::Float64)
-    return Server(Queue{Job}(), max_buffer_size, overflow_vector, move_vector, service_rate)
+    return Server(unique_id::Int, Queue{Job}(), max_buffer_size, overflow_vector, move_vector, service_rate)
 end
 
 struct ArrivalEvent <: Event
@@ -69,11 +76,12 @@ end
 end
 
 
-struct DiscreteState <: State
+mutable struct DiscreteState <: State
     servers::Vector{Server}     # Enumerated list of servers
     left_jobs::Vector{Job}      # Enumerated list of jobs that have left the system
     moving_jobs::Vector{Job}    # Enumerated list of jobs that are moving across servers
     last_job::Int64             # Index of last-added job
+    jobs_in_system::Int64
     params::NetworkParameters   # Hold our params in the state (is this a good idea? we'll find out)
 end
 
@@ -83,8 +91,8 @@ end
 Creates a DiscreteState, populates it with `servers` and `params` based on the given. First `job` index is 1, and all `job` storages start empty
 """
 function DiscreteState(params::NetworkParameters)
-    servers = [Server(params.K[i], params.Q[i], params.P[i], params.μ_vector[i]) for i in 1:params.L]
-    return DiscreteState(servers, Vector{Job}(), Vector{Job}(), 1, params)
+    servers = [Server(i, params.K[i], Vector{Float64}(vec(params.Q[i:params.L:end])), Vector{Float64}(vec(params.P[i:params.L:end])), params.μ_vector[i]) for i in 1:params.L]
+    return DiscreteState(servers, Vector{Job}(), Vector{Job}(), 1, 0, params)
 end
 
 """
@@ -111,8 +119,8 @@ end
 """
 Returns index of `Server` a `Job` should transfer to, or 0 if the `Job` should leave
 """
-function sample_probabilities(transfer_probs::Vector{Float64})
-    return sample(vcat(0, 1:length(transfer_probs)), Weights(vcat(1-sum(transfer_probs), transfer_probs)), 1)
+function sample_probabilities(transfer_probs::Vector{Float64})::Int
+    return first(sample(vcat(0, 1:length(transfer_probs)), Weights(vcat(1-sum(transfer_probs), transfer_probs)), 1))
 end
 
 """
@@ -141,6 +149,7 @@ Process a job leaving the system. Simply adds it to the state's array of left jo
 """
 function leave_job(state::DiscreteState, job::Job)
     push!(state.left_jobs, job)
+    println("Job #", job.unique_id, " left")
 end
 
 """
@@ -174,9 +183,9 @@ function add_job(state::DiscreteState, server::Server, job::Job)
     if isfull(server)
         return process_transfer_from(state, server, job, true)
     else
-        enqueue!(buffer, job)
-        isempty(server) && return ServedEvent(server)
-        return nothing
+        ret = isempty(server) ? ServedEvent(server) : nothing
+        enqueue!(server.buffer, job)
+        return ret
     end
 end
 
@@ -190,13 +199,14 @@ end
 
 """
     process_event(time::Float64, state::DiscreteState, event::ArrivalEvent)
-    
+
 Processes a Job's arrival:
  - Schedules the next Job's arrival
  - Attempts to add this job to a server
 """
 function process_event(time::Float64, state::DiscreteState, event::ArrivalEvent)
-    # Increase number in system
+    
+    println("Job #", state.last_job, " Arrived")
     state.last_job += 1
     new_timed_events = TimedEvent[]
 
@@ -209,6 +219,8 @@ function process_event(time::Float64, state::DiscreteState, event::ArrivalEvent)
     !isnothing(new_event) && push!(new_timed_events, generate_timed_event(time,state, new_event))
     # # If this is the only job on the server
     # state.number_in_system == 1 && push!(new_timed_events,TimedEvent(EndOfServiceEvent(), time + 1/μ))
+    # Increase number in system
+    
     return new_timed_events
 end
 
@@ -224,7 +236,7 @@ Handles a `Job`'s completion:
 """
 function process_event(time::Float64, state::DiscreteState, event::ServedEvent)
     job = process_job(event.server)
-
+    println("Served Job #", job.unique_id, " at Server #", event.server.unique_id)
     new_timed_events = TimedEvent[]
     !isempty(event.server) && push!(new_timed_events, generate_timed_event(time, state, ServedEvent(event.server)))
 
@@ -247,6 +259,7 @@ Attempts to add a `Job` to a `Server`'s buffer, handles results
 function process_event(time::Float64, state::DiscreteState, event::TransferEvent)
     job = event.job
     server_to = event.transfer_to
+    println("Transferring Job #", job.unique_id, " to Server #", server_to.unique_id)
     new_event = add_job(state, server_to, job)
     return !isnothing(new_event) ? TimedEvent[generate_timed_event(time, state, new_event)] : TimedEvent[]
 end
@@ -257,7 +270,7 @@ end
 Generates a `TimedEvent` for a `TransferEvent`. Its `time` is the current + global gamma distributed `η`
 """
 function generate_timed_event(time::Float64, state::DiscreteState, event::TransferEvent)::TimedEvent
-    return TimedEvent(time + generate_time(state.params.η, state.params.gamma_scv), event)
+    return TimedEvent(event, time + generate_time(state.params.η, state.params.gamma_scv))
 end
 
 """
@@ -266,7 +279,7 @@ end
 Generates a `TimedEvent` for a `ServedEvent`. Its `time` is the current + gamma distributed `Server`'s rate
 """
 function generate_timed_event(time::Float64, state::DiscreteState, event::ServedEvent)::TimedEvent
-    return TimedEvent(time + generate_time(event.server.service_rate, state.params.gamma_scv), event)
+    return TimedEvent(event, time + generate_time(event.server.service_rate, state.params.gamma_scv))
 end
 
 """
@@ -275,7 +288,7 @@ end
 Generates a `TimedEvent` for an `ArrivalEvent`. Its `time` is the current + global arrival rate (will not be constant)
 """
 function generate_timed_event(time::Float64, state::DiscreteState, event::ArrivalEvent)::TimedEvent
-    return TimedEvent(time + generate_time(state.params.λ, state.params.gamma_scv), event)
+    return TimedEvent(event, time + generate_time(state.params.λ, state.params.gamma_scv))
 end
 
 """
