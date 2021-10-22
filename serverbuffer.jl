@@ -8,16 +8,18 @@ struct Job
     unique_id::Int64
 end
 
-function Job(unique_id::Int64)
-    return Job(unique_id)
-end
+# function Job(unique_id::Int64)
+#     return Job(unique_id)
+# end
 
 struct Server
     unique_id::Int
     buffer::Queue{Job}           # First element in buffer is currently served job
     max_buffer_size::Int         # Buffer size before overflow
     overflow_vector::Vector{Float64} # Probabilities of where an overflown job will go
+    overflow_leave::Float64
     move_vector::Vector{Float64}     # Probabilities of where a finished job will go
+    move_leave::Float64
     service_rate::Float64        # Mean service rate of this server
 end
 
@@ -25,7 +27,7 @@ function Server(unique_id::Int, max_buffer_size::Int,
     overflow_vector::Vector{Float64}, 
     move_vector::Vector{Float64},  
     service_rate::Float64)
-    return Server(unique_id::Int, Queue{Job}(), max_buffer_size, overflow_vector, move_vector, service_rate)
+    return Server(unique_id::Int, Queue{Job}(), max_buffer_size, overflow_vector, 1-sum(overflow_vector), move_vector, 1-sum(move_vector), service_rate)
 end
 
 struct ArrivalEvent <: Event
@@ -80,8 +82,10 @@ mutable struct DiscreteState <: State
     servers::Vector{Server}     # Enumerated list of servers
     left_jobs::Vector{Job}      # Enumerated list of jobs that have left the system
     moving_jobs::Vector{Job}    # Enumerated list of jobs that are moving across servers
+    moving_jobs_num::Int        # Number of moving jobs (cheap memory-wise to keep them here)
     last_job::Int64             # Index of last-added job
-    jobs_in_system::Int64
+    jobs_in_system::Int64       # Number of total jobs in sys (also cheap memory-wise)
+    is_debug::Bool              
     params::NetworkParameters   # Hold our params in the state (is this a good idea? we'll find out)
 end
 
@@ -92,7 +96,7 @@ Creates a DiscreteState, populates it with `servers` and `params` based on the g
 """
 function DiscreteState(params::NetworkParameters)
     servers = [Server(i, params.K[i], Vector{Float64}(vec(params.Q[i:params.L:end])), Vector{Float64}(vec(params.P[i:params.L:end])), params.μ_vector[i]) for i in 1:params.L]
-    return DiscreteState(servers, Vector{Job}(), Vector{Job}(), 1, 0, params)
+    return DiscreteState(servers, Vector{Job}(), Vector{Job}(), 0, 1, 0, false, params)
 end
 
 """
@@ -119,22 +123,22 @@ end
 """
 Returns index of `Server` a `Job` should transfer to, or 0 if the `Job` should leave
 """
-function sample_probabilities(transfer_probs::Vector{Float64})::Int
-    return first(sample(vcat(0, 1:length(transfer_probs)), Weights(vcat(1-sum(transfer_probs), transfer_probs)), 1))
+function sample_probabilities(transfer_probs::Vector{Float64}, chance_leave::Float64)::Int
+    return rand() < chance_leave ? 0 : sample(1:length(transfer_probs), Weights(transfer_probs))
 end
 
 """
 Returns server index a job should overflow to, or 0 if job should leave
 """
 function get_overflow_index_from(server::Server)::Int
-    return sample_probabilities(server.overflow_vector)
+    return sample_probabilities(server.overflow_vector, server.overflow_leave)
 end
 
 """
 Returns server index a job should move to, or 0 if job should leave
 """
 function get_move_index_from(server::Server)::Int
-    return sample_probabilities(server.move_vector)
+    return sample_probabilities(server.move_vector, server.move_leave)
 end
 
 """
@@ -148,8 +152,9 @@ end
 Process a job leaving the system. Simply adds it to the state's array of left jobs
 """
 function leave_job(state::DiscreteState, job::Job)
-    push!(state.left_jobs, job)
-    println("Job #", job.unique_id, " left")
+    state.jobs_in_system -= 1
+    # push!(state.left_jobs, job)
+    # # state.is_debug && println("Job #", job.unique_id, " left")
 end
 
 """
@@ -165,6 +170,7 @@ function process_transfer_from(state::DiscreteState, server::Server, job::Job, i
         leave_job(state, job)
         return nothing
     else
+        state.moving_jobs_num += 1
         return is_overflow ? OverflowEvent(get_transfer_from_index(state, ind), job) : MoveEvent(get_transfer_from_index(state, ind), job)
     end 
 end
@@ -206,14 +212,15 @@ Processes a Job's arrival:
 """
 function process_event(time::Float64, state::DiscreteState, event::ArrivalEvent)
     
-    println("Job #", state.last_job, " Arrived")
+    # # state.is_debug && println("Job #", state.last_job, " Arrived")
     state.last_job += 1
+    state.jobs_in_system += 1
     new_timed_events = TimedEvent[]
 
     # Prepare next arrival
     push!(new_timed_events,generate_timed_event(time, state, ArrivalEvent(state.last_job)))
 
-    server = state.servers[sample_probabilities(state.params.p_e)]  # We will need to assert sum(p_e) = 1
+    server = state.servers[sample_probabilities(state.params.p_e, .0)]  # We will need to assert sum(p_e) = 1
 
     new_event = add_job(state, server, event.job)
     !isnothing(new_event) && push!(new_timed_events, generate_timed_event(time,state, new_event))
@@ -236,7 +243,7 @@ Handles a `Job`'s completion:
 """
 function process_event(time::Float64, state::DiscreteState, event::ServedEvent)
     job = process_job(event.server)
-    println("Served Job #", job.unique_id, " at Server #", event.server.unique_id)
+    # # state.is_debug && println("Served Job #", job.unique_id, " at Server #", event.server.unique_id)
     new_timed_events = TimedEvent[]
     !isempty(event.server) && push!(new_timed_events, generate_timed_event(time, state, ServedEvent(event.server)))
 
@@ -258,8 +265,9 @@ Attempts to add a `Job` to a `Server`'s buffer, handles results
 """
 function process_event(time::Float64, state::DiscreteState, event::TransferEvent)
     job = event.job
+    state.moving_jobs_num -= 1
     server_to = event.transfer_to
-    println("Transferring Job #", job.unique_id, " to Server #", server_to.unique_id)
+    # # state.is_debug && println("Transferring Job #", job.unique_id, " to Server #", server_to.unique_id)
     new_event = add_job(state, server_to, job)
     return !isnothing(new_event) ? TimedEvent[generate_timed_event(time, state, new_event)] : TimedEvent[]
 end
